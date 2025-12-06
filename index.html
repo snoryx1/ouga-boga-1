@@ -1,0 +1,498 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0"/>
+<title>Mini Battle Royale (2-8 players)</title>
+<style>
+  html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;background:#111;color:#eee}
+  #ui {position:fixed;left:8px;top:8px;z-index:10;background:rgba(0,0,0,0.4);padding:10px;border-radius:8px}
+  #roomCode{font-weight:bold}
+  canvas{display:block;margin:0 auto;background:#0b1220;touch-action:none}
+  button,input{margin:6px 0;padding:8px;border-radius:6px;border:0;background:#1f6; color:#000; font-weight:600}
+  #joinBtn{background:#29f;color:#fff}
+  #status{margin-top:6px;color:#ddd;font-size:13px}
+  #joystick{position:fixed;right:12px;bottom:12px;width:120px;height:120px;touch-action:none}
+  #pad{width:100%;height:100%;border-radius:50%;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center}
+  #stick{width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,0.12)}
+  .small{font-size:12px;padding:6px}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div>
+    <button id="createBtn">Create Room</button>
+    <input id="roomInput" placeholder="Room code" class="small" />
+    <button id="joinBtn">Join</button>
+  </div>
+  <div id="roomBox" style="display:none">
+    Room: <span id="roomCode">-</span>
+    <div id="status">Not connected</div>
+    <div>Players: <span id="playersCount">0</span></div>
+    <button id="startBtn" class="small">Start Match</button>
+  </div>
+</div>
+
+<canvas id="game" width="720" height="480"></canvas>
+
+<!-- Virtual joystick for phone -->
+<div id="joystick" style="display:none">
+  <div id="pad"><div id="stick"></div></div>
+</div>
+
+<!-- Firebase SDK v8 (simpler namespaced API) -->
+<script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-auth.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+
+<script>
+/* =========================
+   CONFIG - REPLACE with your Firebase config
+   ========================= */
+const firebaseConfig = {
+  apiKey: "AIzaSyBExGBqXG-rnK1-8vZUoVq35VEgfJy64XE",
+  authDomain: "ouga-boga.firebaseapp.com",
+  databaseURL: "https://ouga-boga-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "ouga-boga",
+  storageBucket: "ouga-boga.firebasestorage.app",
+  messagingSenderId: "1093562379536",
+  appId: "1:1093562379536:web:a060fb4f333d5f9d020995",
+  measurementId: "G-28SQPL5TJW"
+};
+/* ========================= */
+firebase.initializeApp(firebaseConfig);
+
+const auth = firebase.auth();
+const db = firebase.database();
+
+/* --- Simple helper utils --- */
+function uid() {
+  return auth.currentUser ? auth.currentUser.uid : 'anon_' + Math.random().toString(36).substr(2,7);
+}
+function randCode(len=4){ return Math.random().toString(36).substr(2, len).toUpperCase(); }
+
+/* --- Basic game constants --- */
+const MAP_W = 1600, MAP_H = 1200; // virtual map size
+const SEND_RATE = 100; // ms between position updates (~10Hz)
+const PLAYER_RADIUS = 16;
+const BULLET_SPEED = 12;
+const BULLET_LIFE = 1800; // ms
+const MAX_PLAYERS = 8;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let scale = 1;
+
+/* --- UI elements --- */
+const createBtn = document.getElementById('createBtn');
+const joinBtn = document.getElementById('joinBtn');
+const roomInput = document.getElementById('roomInput');
+const roomBox = document.getElementById('roomBox');
+const roomCodeEl = document.getElementById('roomCode');
+const statusEl = document.getElementById('status');
+const playersCountEl = document.getElementById('playersCount');
+const startBtn = document.getElementById('startBtn');
+const joystickWrap = document.getElementById('joystick');
+const pad = document.getElementById('pad');
+const stick = document.getElementById('stick');
+
+let localPlayer = null;
+let roomId = null;
+let players = {}; // all players from DB
+let bullets = {}; // bullets list
+let dbPlayersRef = null;
+let dbBulletsRef = null;
+let sendInterval = null;
+let lastSent = 0;
+let isPlaying = false;
+let keys = {};
+
+/* --- Authentication --- */
+async function doAuth() {
+  try {
+    await auth.signInAnonymously();
+    console.log('signed in:', auth.currentUser.uid);
+  } catch(e) {
+    console.error('auth failed', e);
+  }
+}
+doAuth();
+
+/* --- Room create/join logic --- */
+createBtn.onclick = () => {
+  const code = randCode(4);
+  joinRoom(code);
+};
+joinBtn.onclick = () => {
+  const code = (roomInput.value || '').trim().toUpperCase();
+  if (!code) return alert('Enter room code or Create one.');
+  joinRoom(code);
+};
+
+function joinRoom(code) {
+  roomId = code;
+  roomCodeEl.textContent = roomId;
+  roomBox.style.display = 'block';
+  statusEl.textContent = 'Connecting...';
+  setupLocalPlayer();
+  attachRoomListeners();
+  showJoystick(true);
+}
+
+startBtn.onclick = () => {
+  // simple start: set meta.started = true
+  if (!roomId) return;
+  db.ref(`rooms/${roomId}/meta`).set({started:true, startedAt:Date.now()});
+};
+
+/* --- Setup local player object --- */
+function setupLocalPlayer() {
+  const id = uid();
+  localPlayer = {
+    id,
+    x: Math.random()*(MAP_W-200)+100,
+    y: Math.random()*(MAP_H-200)+100,
+    vx:0, vy:0,
+    dir:0,
+    hp:100,
+    name: 'P-'+id.substr(0,4),
+    alive: true,
+    lastShot:0
+  };
+  // write initial presence
+  db.ref(`rooms/${roomId}/players/${localPlayer.id}`).set(localPlayer);
+  // remove on disconnect
+  db.ref(`rooms/${roomId}/players/${localPlayer.id}`).onDisconnect().remove();
+}
+
+/* --- Attach DB listeners --- */
+function attachRoomListeners() {
+  dbPlayersRef = db.ref(`rooms/${roomId}/players`);
+  dbBulletsRef = db.ref(`rooms/${roomId}/bullets`);
+  const metaRef = db.ref(`rooms/${roomId}/meta`);
+
+  dbPlayersRef.on('value', snap => {
+    players = snap.val() || {};
+    playersCountEl.textContent = Object.keys(players).length;
+  });
+
+  dbPlayersRef.on('child_changed', snap => {
+    const p = snap.val();
+    if (p && p.id && p.id !== localPlayer.id) {
+      players[p.id] = {...players[p.id], ...p};
+    }
+  });
+
+  dbPlayersRef.on('child_removed', snap => {
+    const id = snap.key;
+    delete players[id];
+  });
+
+  dbBulletsRef.on('child_added', snap => {
+    const b = snap.val();
+    if (!b) return;
+    bullets[b.id] = b;
+    // schedule removal local when lifetime is done
+    setTimeout(()=> {
+      delete bullets[b.id];
+      db.ref(`rooms/${roomId}/bullets/${b.id}`).remove().catch(()=>{});
+    }, BULLET_LIFE+2000);
+  });
+
+  metaRef.on('value', snap => {
+    const meta = snap.val()||{};
+    if (meta.started) {
+      isPlaying = true;
+      statusEl.textContent = 'Match started!';
+      // reset players hp if local
+      Object.keys(players).forEach(k=>{
+        if (players[k].id && players[k].id === localPlayer.id) {
+          db.ref(`rooms/${roomId}/players/${localPlayer.id}/hp`).set(100);
+          db.ref(`rooms/${roomId}/players/${localPlayer.id}/alive`).set(true);
+        }
+      });
+    }
+  });
+
+  statusEl.textContent = 'Connected (waiting)';
+  // start sending local position regularly
+  if (sendInterval) clearInterval(sendInterval);
+  sendInterval = setInterval(sendLocalState, SEND_RATE);
+}
+
+/* --- Send local player state to DB --- */
+function sendLocalState() {
+  if (!localPlayer || !roomId) return;
+  // update position based on vx,vy
+  const now = Date.now();
+  localPlayer.x = Math.max(16, Math.min(MAP_W-16, localPlayer.x + localPlayer.vx));
+  localPlayer.y = Math.max(16, Math.min(MAP_H-16, localPlayer.y + localPlayer.vy));
+  localPlayer.dir = Math.atan2(localPlayer.vy, localPlayer.vx) || localPlayer.dir;
+  // write less frequently
+  db.ref(`rooms/${roomId}/players/${localPlayer.id}`).update({
+    x: localPlayer.x,
+    y: localPlayer.y,
+    vx: localPlayer.vx,
+    vy: localPlayer.vy,
+    dir: localPlayer.dir,
+    hp: localPlayer.hp,
+    alive: localPlayer.alive,
+    name: localPlayer.name,
+    ts: now
+  }).catch(console.error);
+}
+
+/* --- Shooting --- */
+function shoot() {
+  if (!isPlaying || !localPlayer.alive) return;
+  const now = Date.now();
+  if (now - localPlayer.lastShot < 350) return; // 350 ms fire rate
+  localPlayer.lastShot = now;
+  const bid = 'b_' + Math.random().toString(36).substr(2,9);
+  const dir = localPlayer.dir || 0;
+  const b = {
+    id: bid,
+    owner: localPlayer.id,
+    x: localPlayer.x + Math.cos(dir)*20,
+    y: localPlayer.y + Math.sin(dir)*20,
+    vx: Math.cos(dir) * BULLET_SPEED,
+    vy: Math.sin(dir) * BULLET_SPEED,
+    t: Date.now()
+  };
+  db.ref(`rooms/${roomId}/bullets/${bid}`).set(b).catch(console.error);
+  bullets[bid] = b;
+}
+
+/* --- Game update loop / simulation of bullets locally --- */
+function update(dt) {
+  // update local bullet positions and collision
+  const now = Date.now();
+  for (const id in bullets) {
+    const b = bullets[id];
+    const age = now - b.t;
+    if (age > BULLET_LIFE) {
+      delete bullets[id];
+      db.ref(`rooms/${roomId}/bullets/${id}`).remove().catch(()=>{});
+      continue;
+    }
+    b.x += b.vx * (dt/16);
+    b.y += b.vy * (dt/16);
+    // check collisions with players (simple circle overlap)
+    for (const pid in players) {
+      const p = players[pid];
+      if (!p || !p.alive) continue;
+      // skip if owner or already dead
+      if (pid === b.owner) continue;
+      const dx = p.x - b.x, dy = p.y - b.y;
+      const dist2 = dx*dx + dy*dy;
+      if (dist2 < (PLAYER_RADIUS+6)*(PLAYER_RADIUS+6)) {
+        // hit!
+        const newHp = (p.hp || 100) - 20;
+        db.ref(`rooms/${roomId}/players/${pid}/hp`).set(newHp);
+        if (newHp <= 0) {
+          db.ref(`rooms/${roomId}/players/${pid}/alive`).set(false);
+          db.ref(`rooms/${roomId}/players/${pid}/ts_dead`).set(Date.now());
+        }
+        delete bullets[id];
+        db.ref(`rooms/${roomId}/bullets/${id}`).remove().catch(()=>{});
+        break;
+      }
+    }
+  }
+
+  // check for win condition (only local check; meta winner could be written)
+  const alivePlayers = Object.values(players).filter(p=>p && p.alive);
+  if (isPlaying && alivePlayers.length <= 1) {
+    if (alivePlayers.length === 1 && alivePlayers[0].id === localPlayer.id) {
+      statusEl.textContent = 'You win!';
+      db.ref(`rooms/${roomId}/meta/winner`).set(localPlayer.id);
+    } else {
+      statusEl.textContent = 'Match over';
+    }
+    isPlaying = false;
+    db.ref(`rooms/${roomId}/meta/started`).set(false);
+  }
+}
+
+/* --- Render --- */
+let camX = 0, camY = 0;
+function draw() {
+  // adapt canvas to window
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  canvas.width = Math.min(900, Math.max(600, w-10));
+  canvas.height = Math.min(600, Math.max(360, h-120));
+  // scale for high-dpi optional
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if (!localPlayer) return;
+
+  // camera follows local player centered
+  camX = localPlayer.x - canvas.width/2;
+  camY = localPlayer.y - canvas.height/2;
+  // clamp camera to map
+  camX = Math.max(0, Math.min(MAP_W - canvas.width, camX));
+  camY = Math.max(0, Math.min(MAP_H - canvas.height, camY));
+
+  // draw map background (grid)
+  ctx.fillStyle = '#071018';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // simple grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+  ctx.lineWidth = 1;
+  const gridSize = 64;
+  for (let gx = - (camX % gridSize); gx < canvas.width; gx += gridSize) {
+    ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,canvas.height); ctx.stroke();
+  }
+  for (let gy = - (camY % gridSize); gy < canvas.height; gy += gridSize) {
+    ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(canvas.width,gy); ctx.stroke();
+  }
+
+  // draw bullets
+  for (const id in bullets) {
+    const b = bullets[id];
+    const sx = b.x - camX, sy = b.y - camY;
+    ctx.beginPath();
+    ctx.fillStyle = '#ffdd88';
+    ctx.arc(sx, sy, 5, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // draw players
+  for (const id in players) {
+    const p = players[id];
+    if (!p) continue;
+    // simple interpolation: we don't keep history here; just draw
+    const sx = p.x - camX, sy = p.y - camY;
+    ctx.beginPath();
+    ctx.fillStyle = p.alive ? (p.id === localPlayer.id ? '#8cf' : '#f88') : '#444';
+    ctx.arc(sx, sy, PLAYER_RADIUS, 0, Math.PI*2);
+    ctx.fill();
+    // health bar
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(sx-20, sy-28, 40, 6);
+    ctx.fillStyle = '#0f0';
+    ctx.fillRect(sx-20, sy-28, 40 * Math.max(0, (p.hp||0))/100, 6);
+    // name
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px sans-serif';
+    ctx.fillText((p.name||'Player').substr(0,10), sx-20, sy-34);
+  }
+
+  // local HUD
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.fillRect(8, canvas.height-48, 220, 40);
+  ctx.fillStyle = '#fff';
+  ctx.font = '14px sans-serif';
+  ctx.fillText('HP: ' + Math.max(0, Math.round(localPlayer.hp||0)), 16, canvas.height-22);
+  ctx.fillText('Room: ' + (roomId||'-'), 110, canvas.height-22);
+}
+
+/* --- Input: keyboard for desktop, virtual joystick for mobile --- */
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if (e.key === ' ') shoot(); });
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+function processInput() {
+  // keyboard
+  let ax=0, ay=0;
+  if (keys['w']||keys['arrowup']) ay -= 1;
+  if (keys['s']||keys['arrowdown']) ay += 1;
+  if (keys['a']||keys['arrowleft']) ax -= 1;
+  if (keys['d']||keys['arrowright']) ax += 1;
+  // joystick will modify localPlayer.vx/vy directly
+  if (!joystickActive) {
+    const sp = 3.8;
+    if (ax!==0 || ay!==0) {
+      const mag = Math.hypot(ax,ay) || 1;
+      localPlayer.vx = (ax/mag) * sp;
+      localPlayer.vy = (ay/mag) * sp;
+      localPlayer.dir = Math.atan2(localPlayer.vy, localPlayer.vx);
+    } else {
+      localPlayer.vx *= 0.8;
+      localPlayer.vy *= 0.8;
+      if (Math.abs(localPlayer.vx) < 0.05) localPlayer.vx = 0;
+      if (Math.abs(localPlayer.vy) < 0.05) localPlayer.vy = 0;
+    }
+  }
+}
+
+/* --- Virtual joystick implementation --- */
+let joystickActive = false;
+let stickCenter = {x:0,y:0}, stickPos = {x:0,y:0};
+function showJoystick(show) {
+  joystickWrap.style.display = show ? 'block' : 'none';
+}
+pad.addEventListener('pointerdown', startDrag);
+pad.addEventListener('pointermove', drag);
+pad.addEventListener('pointerup', endDrag);
+pad.addEventListener('pointercancel', endDrag);
+pad.addEventListener('pointerleave', endDrag);
+
+function startDrag(e) {
+  pad.setPointerCapture(e.pointerId);
+  joystickActive = true;
+  const r = pad.getBoundingClientRect();
+  stickCenter = {x: r.left + r.width/2, y: r.top + r.height/2};
+  updateStick(e.clientX, e.clientY);
+}
+function drag(e) {
+  if (!joystickActive) return;
+  updateStick(e.clientX, e.clientY);
+}
+function endDrag(e) {
+  joystickActive = false;
+  stick.style.transform = `translate(0px,0px)`;
+  localPlayer.vx = 0; localPlayer.vy = 0;
+}
+function updateStick(cx, cy) {
+  const dx = cx - stickCenter.x;
+  const dy = cy - stickCenter.y;
+  const max = 44;
+  const d = Math.hypot(dx,dy);
+  const nx = (d>max) ? dx * (max/d) : dx;
+  const ny = (d>max) ? dy * (max/d) : dy;
+  stick.style.transform = `translate(${nx}px,${ny}px)`;
+  const normX = nx / max;
+  const normY = ny / max;
+  const speed = 4.2;
+  localPlayer.vx = normX * speed;
+  localPlayer.vy = normY * speed;
+  localPlayer.dir = Math.atan2(localPlayer.vy, localPlayer.vx);
+}
+
+/* --- Click/tap to shoot direction --- */
+canvas.addEventListener('pointerdown', function(e){
+  // compute world coordinates of pointer
+  const rect = canvas.getBoundingClientRect();
+  const wx = camX + (e.clientX - rect.left);
+  const wy = camY + (e.clientY - rect.top);
+  const dx = wx - localPlayer.x;
+  const dy = wy - localPlayer.y;
+  localPlayer.dir = Math.atan2(dy, dx);
+  shoot();
+});
+
+let lastTime = performance.now();
+function loop(now) {
+  const dt = now - lastTime;
+  lastTime = now;
+  processInput();
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* --- Clean up on unload --- */
+window.addEventListener('beforeunload', () => {
+  if (roomId && localPlayer) {
+    db.ref(`rooms/${roomId}/players/${localPlayer.id}`).remove();
+  }
+});
+
+/* --- For debugging: show DB contents in console --- */
+window.showState = ()=>{ console.log('players', players, 'bullets', bullets); };
+
+</script>
+</body>
+</html>
